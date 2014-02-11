@@ -1,117 +1,74 @@
 #!/bin/bash
 
+DOCKER_SERVER=${DOCKER_SERVER:-"localdocker"}
+DOCKER_IP=$(ping -c 1 $DOCKER_SERVER | grep PING | cut -d\( -f2 | cut -d\) -f1)
+
 echo 
 echo "Create MySQL Tier"
 echo "-----------------"
 echo "* Create MySQL01"
 
-MYSQL01=$(docker run -d paulczar/mysql mysqld_safe --server-id=1 --log-bin=mysql-bin --log-slave-updates=1)
-MYSQL01_IP=$(docker inspect $MYSQL01 | grep IPAd | awk -F'"' '{print $4}')
+MYSQL01=$(docker run -d -p 3306 paulczar/mysql mysqld_safe --server-id=1 --log-bin=mysql-bin --log-slave-updates=1)
+MYSQL01_IP=$DOCKER_IP
+MYSQL01_PORT=$(docker port $MYSQL01 3306 | cut -d: -f2)
 
 echo "* Create MySQL02"
 
-MYSQL02=$(docker run -d paulczar/mysql mysqld_safe --server-id=2 --log-bin=mysql-bin --log-slave-updates=1 --auto_increment_increment=2 --auto_increment_offset=2)
-MYSQL02_IP=$(docker inspect $MYSQL02 | grep IPAd | awk -F'"' '{print $4}')
+MYSQL02=$(docker run -d -p 3306 paulczar/mysql mysqld_safe --server-id=2 --log-bin=mysql-bin --log-slave-updates=1 --auto_increment_increment=2 --auto_increment_offset=2)
+MYSQL02_IP=$DOCKER_IP
+MYSQL02_PORT=$(docker port $MYSQL02 3306 | cut -d: -f2)
 
 echo "* Sleep for two seconds for servers to come online..."
 sleep 2
 
 echo "* Creat replication user"
 
-mysql -uroot -proot -h $MYSQL01_IP -AN -e 'GRANT REPLICATION SLAVE ON *.* TO "replication"@"%" IDENTIFIED BY "password";'
-mysql -uroot -proot -h $MYSQL01_IP -AN -e 'flush privileges;'
+mysql -uroot -proot -h $MYSQL01_IP -P $MYSQL01_PORT -AN -e 'GRANT REPLICATION SLAVE ON *.* TO "replication"@"%" IDENTIFIED BY "password";'
+mysql -uroot -proot -h $MYSQL01_IP -P $MYSQL01_PORT -AN -e 'flush privileges;'
 
 
 echo "* Export Data from MySQL01 to MySQL02"
 
-mysqldump -uroot -proot -h $MYSQL01_IP --single-transaction --all-databases \
-	--flush-privileges | mysql -uroot -proot -h $MYSQL02_IP
+mysqldump -uroot -proot -h $MYSQL01_IP -P $MYSQL01_PORT --single-transaction --all-databases \
+	--flush-privileges | mysql -uroot -proot -h $MYSQL02_IP -P $MYSQL02_PORT
 
 echo "* Set MySQL01 as master on MySQL02"
 
-MYSQL01_Position=$(mysql -uroot -proot -h $MYSQL01_IP -e "show master status \G" | grep Position | awk '{print $2}')
-MYSQL01_File=$(mysql -uroot -proot -h $MYSQL01_IP -e "show master status \G"     | grep File     | awk '{print $2}')
+MYSQL01_Position=$(mysql -uroot -proot -h $MYSQL01_IP -P $MYSQL01_PORT -e "show master status \G" | grep Position | awk '{print $2}')
+MYSQL01_File=$(mysql -uroot -proot -h $MYSQL01_IP -P $MYSQL01_PORT -e "show master status \G"     | grep File     | awk '{print $2}')
 
-mysql -uroot -proot -h $MYSQL02_IP -AN -e "CHANGE MASTER TO master_host='$MYSQL01_IP', master_port=3306, \
+mysql -uroot -proot -h $MYSQL02_IP -P $MYSQL02_PORT -AN -e "CHANGE MASTER TO master_host='$MYSQL01_IP', master_port=$MYSQL01_PORT, \
 	master_user='replication', master_password='password', master_log_file='$MYSQL01_File', \
 	master_log_pos=$MYSQL01_Position;"
 
-echo "* Set MySQL02 as master on MySQL01"
+# echo "* Set MySQL02 as master on MySQL01"
 
-MYSQL02_Position=$(mysql -uroot -proot -h $MYSQL02_IP -e "show master status \G" | grep Position | awk '{print $2}')
-MYSQL02_File=$(mysql -uroot -proot -h $MYSQL02_IP -e "show master status \G"     | grep File     | awk '{print $2}')
+# MYSQL02_Position=$(mysql -uroot -proot -h $MYSQL02_IP -e "show master status \G" | grep Position | awk '{print $2}')
+# MYSQL02_File=$(mysql -uroot -proot -h $MYSQL02_IP -e "show master status \G"     | grep File     | awk '{print $2}')
 
-mysql -uroot -proot -h $MYSQL01_IP -AN -e "CHANGE MASTER TO master_host='$MYSQL02_IP', master_port=3306, \
-	master_user='replication', master_password='password', master_log_file='$MYSQL02_File', \
-	master_log_pos=$MYSQL02_Position;"
+#mysql -uroot -proot -h $MYSQL01_IP -AN -e "CHANGE MASTER TO master_host='$MYSQL02_IP', master_port=3306, \
+#	master_user='replication', master_password='password', master_log_file='$MYSQL02_File', \
+#	master_log_pos=$MYSQL02_Position;"
 
 echo "* Start Slave on both Servers"
-mysql -uroot -proot -h $MYSQL01_IP -AN -e "start slave;"
-mysql -uroot -proot -h $MYSQL02_IP -AN -e "start slave;"
+#mysql -uroot -proot -h $MYSQL01_IP -P $MYSQL01_PORT -AN -e "start slave;"
+mysql -uroot -proot -h $MYSQL02_IP -P $MYSQL02_PORT -AN -e "start slave;"
 
 echo "* Create database 'wordpress' on MySQL01"
 
-mysql -uroot -proot -h $MYSQL01_IP -e "create database wordpress;"
+mysql -uroot -proot -h $MYSQL01_IP -P $MYSQL01_PORT -e "create database wordpress;"
 
 echo "* Sleep 2 seconds, then check that database 'wordpress' exists on MySQL02"
 
 sleep 2
-mysql -uroot -proot -h $MYSQL02_IP -e "show databases; \G" | grep wordpress
-
-echo 
-echo "Create MySQL Load Balancer"
-echo "--------------------------"
-
-echo "* Create HAProxy-MySQL"
-
-mysql -uroot -proot -h $MYSQL01_IP -AN -e "GRANT USAGE ON *.* TO 'haproxy'@'%';"
-
-HAPROXY_MYSQL=$(docker run -d paulczar/haproxy-mysql /haproxy/start "server Primary $MYSQL01_IP:3306" "server Secondary $MYSQL02_IP:3306")
-HAPROXY_MYSQL_IP=$(docker inspect $HAPROXY_MYSQL | grep IPAd | awk -F'"' '{print $4}')
-
-echo "* Check our haproxy works"
-echo "   (should show alternating server_id)"
-
-mysql -uroot -proot -h $HAPROXY_MYSQL_IP -e 'show variables like "server_id"' | grep server_id
-mysql -uroot -proot -h $HAPROXY_MYSQL_IP -e 'show variables like "server_id"' | grep server_id
-mysql -uroot -proot -h $HAPROXY_MYSQL_IP -e 'show variables like "server_id"' | grep server_id
-mysql -uroot -proot -h $HAPROXY_MYSQL_IP -e 'show variables like "server_id"' | grep server_id
-
-echo 
-echo "Create Wordpress Web Servers"
-echo "------------------------"
-
-echo "* Create WordPress01"
-WORDPRESS1=$(docker run -d paulczar/apache2-wordpress /var/www/start $HAPROXY_MYSQL_IP)
-WORDPRESS1_IP=$(docker inspect $WORDPRESS1 | grep IPAd | awk -F'"' '{print $4}')
-
-echo "* Create WordPress02"
-WORDPRESS2=$(docker run -d paulczar/apache2-wordpress /var/www/start $HAPROXY_MYSQL_IP)
-WORDPRESS2_IP=$(docker inspect $WORDPRESS2 | grep IPAd | awk -F'"' '{print $4}')
-
-echo 
-echo "Create Web Load Balancer"
-echo "--------------------------"
-
-echo "* Create HAProxy-Web"
-HAPROXY_WEB=$(docker run -d paulczar/haproxy-web /haproxy/start "server webA $WORDPRESS1_IP:80 cookie A check" "server webA $WORDPRESS2_IP:80 cookie B check")
-HAPROXY_WEB_IP=$(docker inspect $HAPROXY_WEB | grep IPAd | awk -F'"' '{print $4}')
-
-echo "* Check it works"
-
-curl -s http://$HAPROXY_WEB_IP/phpinfo.php | grep "PHP API"
-
+mysql -uroot -proot -h $MYSQL02_IP -P $MYSQL02_PORT -e "show databases; \G" | grep wordpress
 
 echo "Environment Created!"
 echo "--------------------"
 echo
-echo "Browse to http://$HAPROXY_WEB_IP to access your wordpress site"
-echo
 echo Variables available fo you :-
 echo
 echo MYSQL01_IP       : $MYSQL01_IP
+echo MYSQL01_PORT     : $MYSQL01_PORT
 echo MYSQL02_IP       : $MYSQL02_IP
-echo HAPROXY_MYSQL_IP : $HAPROXY_MYSQL_IP
-echo WORDPRESS1_IP    : $WORDPRESS1_IP
-echo WORDPRESS2_IP    : $WORDPRESS2_IP
-echo HAPROXY_WEB_IP   : $HAPROXY_WEB_IP
+echo MYSQL02_PORT     : $MYSQL02_PORT
